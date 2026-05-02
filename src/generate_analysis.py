@@ -6,7 +6,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import confusion_matrix, f1_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -34,32 +34,39 @@ def load_model(run, device):
 
 
 def evaluate_test(run, model, cfg, device):
-    rec = split(load_all(), "test")
-    print(f"test: {len(rec)} records")
-    loader = DataLoader(EarningsDataset(rec),
-                        batch_size=cfg.get("batch", 4),
-                        shuffle=False, collate_fn=collate)
-    preds, labels = [], []
+    test_records = split(load_all(), "test")
+    print(f"test: {len(test_records)} records")
+    loader = DataLoader(
+        EarningsDataset(test_records),
+        batch_size=cfg.get("batch", 4),
+        shuffle=False,
+        collate_fn=collate,
+    )
+    predictions = []
+    labels = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="eval test"):
-            logits = model(batch["sentences"],
-                           batch["sent_counts"].to(device),
-                           batch["financial"].to(device))
-            preds.extend(logits.argmax(1).cpu().tolist())
+            logits = model(
+                batch["sentences"],
+                batch["sent_counts"].to(device),
+                batch["financial"].to(device),
+            )
+            predictions.extend(logits.argmax(1).cpu().tolist())
             labels.extend(batch["labels"].tolist())
 
-    y, p = np.array(labels), np.array(preds)
-    f1 = f1_score(y, p, average="macro", zero_division=0)
-    acc = (y == p).mean()
+    y_true = np.array(labels)
+    y_pred = np.array(predictions)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    acc = (y_true == y_pred).mean()
     print(f"\nTest macro F1: {f1:.4f}  Accuracy: {acc:.4f}")
-    cm = confusion_matrix(y, p)
+    cm = confusion_matrix(y_true, y_pred)
     print("Confusion matrix (rows=true, cols=pred):")
     print(cm)
 
     out = {"run": run, "split": "test",
            "macro_f1": round(float(f1), 4),
            "accuracy": round(float(acc), 4),
-           "n": len(rec),
+           "n": len(test_records),
            "confusion_matrix": cm.tolist()}
     (Path("checkpoints") / run / "test_results.json").write_text(json.dumps(out, indent=2))
 
@@ -88,27 +95,38 @@ def plot_training_curve(run):
 
 
 def plot_attention(run, model, device):
-    val_rec = split(load_all(), "val")
+    validation_records = split(load_all(), "val")
     random.seed(7)
-    sample = random.sample(val_rec, 100)
+    sample_size = min(100, len(validation_records))
+    sampled_records = random.sample(validation_records, sample_size)
 
     best = None
     with torch.no_grad():
-        for r in sample:
-            batch = collate([r])
-            logits, w = model(batch["sentences"],
-                              batch["sent_counts"].to(device),
-                              batch["financial"].to(device),
-                              return_attention=True)
+        for record in sampled_records:
+            batch = collate([record])
+            logits, attention_weights = model(
+                batch["sentences"],
+                batch["sent_counts"].to(device),
+                batch["financial"].to(device),
+                return_attention=True,
+            )
             pred = logits.argmax(1).item()
-            if pred != r["label"]:
+            if pred != record["label"]:
                 continue
             n = batch["sent_counts"][0].item()
-            weights = w[0, :n].cpu().numpy()
+            weights = attention_weights[0, :n].cpu().numpy()
             top_share = float(weights[np.argsort(weights)[-10:]].sum())
-            if best is None or abs(r["return"]) > abs(best["return"]):
-                best = {"record": r, "weights": weights,
-                        "pred": pred, "top10_share": top_share, "return": r["return"]}
+            if best is None or abs(record["return"]) > abs(best["return"]):
+                best = {
+                    "record": record,
+                    "weights": weights,
+                    "pred": pred,
+                    "top10_share": top_share,
+                    "return": record["return"],
+                }
+
+    if best is None:
+        raise RuntimeError("Could not find a correctly predicted validation example for attention plotting.")
 
     r = best["record"]
     weights = best["weights"]
@@ -123,7 +141,11 @@ def plot_attention(run, model, device):
     ax.set_xlim(-0.5, n - 0.5)
     ax.set_xlabel("Sentence index")
     ax.set_ylabel("Attention weight")
-    ax.set_title(f"{r['ticker']} {r['date'].date()}  return={r['return']:+.3f}  " f"true={CLASSES[r['label']]}  pred={CLASSES[best['pred']]}", fontsize=9)
+    ax.set_title(
+        f"{r['ticker']} {r['date'].date()}  return={r['return']:+.3f}  "
+        f"true={CLASSES[r['label']]}  pred={CLASSES[best['pred']]}",
+        fontsize=9,
+    )
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     out = FIG_DIR / f"{run}_attention.pdf"

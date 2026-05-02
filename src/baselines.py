@@ -1,4 +1,3 @@
-
 import json
 import time
 from pathlib import Path
@@ -11,14 +10,15 @@ from sklearn.metrics import f1_score
 from sklearn.naive_bayes import ComplementNB
 
 FEAT = Path("data/features")
-OUT  = Path("checkpoints/baselines")
+OUT = Path("checkpoints/baselines")
 
 
 def load(split):
-    return (np.load(FEAT / f"labels_{split}.npy"),
-            np.load(FEAT / f"financial_{split}.npy"),
-            sparse.load_npz(FEAT / f"tfidf_{split}.npz"),
-            np.load(FEAT / f"sbert_{split}.npy"))
+    labels = np.load(FEAT / f"labels_{split}.npy")
+    financial = np.load(FEAT / f"financial_{split}.npy")
+    tfidf = sparse.load_npz(FEAT / f"tfidf_{split}.npz")
+    sbert = np.load(FEAT / f"sbert_{split}.npy")
+    return labels, financial, tfidf, sbert
 
 
 def evaluate(name, y, pred, t):
@@ -30,9 +30,9 @@ def evaluate(name, y, pred, t):
 
 
 def fit_eval(name, clf, Xtr, ytr, Xvl, yvl):
-    t = time.time()
+    start_time = time.time()
     clf.fit(Xtr, ytr)
-    return evaluate(name, yvl, clf.predict(Xvl), time.time() - t)
+    return evaluate(name, yvl, clf.predict(Xvl), time.time() - start_time)
 
 
 def mlp_sbert_fin(Xtr, ytr, Xvl, yvl, epochs=30, patience=5):
@@ -41,44 +41,49 @@ def mlp_sbert_fin(Xtr, ytr, Xvl, yvl, epochs=30, patience=5):
     from sklearn.utils.class_weight import compute_class_weight
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    d = Xtr.shape[1]
-    nc = len(np.unique(ytr))
+    feature_dim = Xtr.shape[1]
+    num_classes = len(np.unique(ytr))
     model = nn.Sequential(
-        nn.Linear(d, 256), nn.ReLU(), nn.Dropout(0.3),
+        nn.Linear(feature_dim, 256), nn.ReLU(), nn.Dropout(0.3),
         nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.3),
-        nn.Linear(64, nc),
+        nn.Linear(64, num_classes),
     ).to(device)
-    cw = compute_class_weight("balanced", classes=np.arange(nc), y=ytr)
-    crit = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float).to(device))
+    class_weights = compute_class_weight("balanced", classes=np.arange(num_classes), y=ytr)
+    crit = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float).to(device))
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     loader = DataLoader(TensorDataset(torch.tensor(Xtr, dtype=torch.float),
                                       torch.tensor(ytr, dtype=torch.long)),
                         batch_size=64, shuffle=True)
-    Xvl_t = torch.tensor(Xvl, dtype=torch.float).to(device)
+    validation_features = torch.tensor(Xvl, dtype=torch.float).to(device)
 
-    best, best_w, p = -1.0, None, 0
-    t0 = time.time()
+    best_score = -1.0
+    best_state = None
+    patience_counter = 0
+    start_time = time.time()
     for _ in range(epochs):
         model.train()
-        for Xb, yb in loader:
+        for batch_features, batch_labels in loader:
             opt.zero_grad()
-            crit(model(Xb.to(device)), yb.to(device)).backward()
+            crit(model(batch_features.to(device)), batch_labels.to(device)).backward()
             opt.step()
         model.eval()
         with torch.no_grad():
-            pred = model(Xvl_t).argmax(1).cpu().numpy()
-        f1 = f1_score(yvl, pred, average="macro", zero_division=0)
-        if f1 > best:
-            best, best_w, p = f1, {k: v.clone() for k, v in model.state_dict().items()}, 0
+            predictions = model(validation_features).argmax(1).cpu().numpy()
+        score = f1_score(yvl, predictions, average="macro", zero_division=0)
+        if score > best_score:
+            best_score = score
+            best_state = {key: value.clone() for key, value in model.state_dict().items()}
+            patience_counter = 0
         else:
-            p += 1
-            if p >= patience:
+            patience_counter += 1
+            if patience_counter >= patience:
                 break
-    model.load_state_dict(best_w)
+
+    model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        pred = model(Xvl_t).argmax(1).cpu().numpy()
-    return evaluate("MLP (SBERT + financial)", yvl, pred, time.time() - t0)
+        predictions = model(validation_features).argmax(1).cpu().numpy()
+    return evaluate("MLP (SBERT + financial)", yvl, predictions, time.time() - start_time)
 
 
 def main():
